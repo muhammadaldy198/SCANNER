@@ -12,6 +12,7 @@
       - Scans client-visible ModuleScripts / loaded modules only.
       - Keeps variants whose Colors table is intentionally empty.
       - Supports Color3, ColorSequence, RGB tables, and nested color tables.
+      - Preserves repeated colors and gradient/keypoint order exactly.
       - Does NOT export Chance, SellMultiplier, source paths, or other metadata.
 ]]
 
@@ -220,24 +221,18 @@ local function rgbTriplet(r, g, b)
     return {r, g, b}
 end
 
-local function addColor(out, dedupe, rgb)
+local function addColor(out, rgb)
     if not rgb then
         return
     end
 
-    local key = tostring(rgb[1]) .. "," .. tostring(rgb[2]) .. "," .. tostring(rgb[3])
-
-    if dedupe[key] then
-        return
-    end
-
-    dedupe[key] = true
+    -- Do NOT deduplicate here.
+    -- Repeated colors can be intentional gradient/keypoint data.
     out[#out + 1] = rgb
 end
 
-local function collectColors(value, out, dedupe, seen, depth)
+local function collectColors(value, out, seen, depth)
     out = out or {}
-    dedupe = dedupe or {}
     seen = seen or {}
     depth = depth or 0
 
@@ -248,19 +243,19 @@ local function collectColors(value, out, dedupe, seen, depth)
     local valueType = typeof(value)
 
     if valueType == "Color3" then
-        addColor(out, dedupe, rgbTriplet(value.R, value.G, value.B))
+        addColor(out, rgbTriplet(value.R, value.G, value.B))
         return out
     end
 
     if valueType == "BrickColor" then
-        addColor(out, dedupe, rgbTriplet(value.Color.R, value.Color.G, value.Color.B))
+        addColor(out, rgbTriplet(value.Color.R, value.Color.G, value.Color.B))
         return out
     end
 
     if valueType == "ColorSequence" then
         for _, keypoint in ipairs(value.Keypoints) do
             local c = keypoint.Value
-            addColor(out, dedupe, rgbTriplet(c.R, c.G, c.B))
+            addColor(out, rgbTriplet(c.R, c.G, c.B))
         end
 
         return out
@@ -271,7 +266,6 @@ local function collectColors(value, out, dedupe, seen, depth)
         if hex and #hex == 6 then
             addColor(
                 out,
-                dedupe,
                 rgbTriplet(
                     tonumber(hex:sub(1, 2), 16),
                     tonumber(hex:sub(3, 4), 16),
@@ -283,7 +277,7 @@ local function collectColors(value, out, dedupe, seen, depth)
 
         local rr, gg, bb = value:match("(%d+)%s*[,;]%s*(%d+)%s*[,;]%s*(%d+)")
         if rr and gg and bb then
-            addColor(out, dedupe, rgbTriplet(rr, gg, bb))
+            addColor(out, rgbTriplet(rr, gg, bb))
         end
 
         return out
@@ -304,7 +298,7 @@ local function collectColors(value, out, dedupe, seen, depth)
     local b = tableGetCI(value, "B")
 
     if r ~= nil and g ~= nil and b ~= nil then
-        addColor(out, dedupe, rgbTriplet(r, g, b))
+        addColor(out, rgbTriplet(r, g, b))
         return out
     end
 
@@ -312,24 +306,31 @@ local function collectColors(value, out, dedupe, seen, depth)
     if type(value[1]) == "number"
     and type(value[2]) == "number"
     and type(value[3]) == "number" then
-        addColor(out, dedupe, rgbTriplet(value[1], value[2], value[3]))
+        addColor(out, rgbTriplet(value[1], value[2], value[3]))
 
-        -- A strict three-number tuple is already a complete color.
         if value[4] == nil then
             return out
         end
     end
 
-    for _, child in pairs(value) do
-        if type(child) == "table" then
-            collectColors(child, out, dedupe, seen, depth + 1)
-        else
+    -- ipairs first so gradient/keypoint order is preserved exactly.
+    local numericSeen = {}
+    for i, child in ipairs(value) do
+        numericSeen[i] = true
+        collectColors(child, out, seen, depth + 1)
+    end
+
+    -- Then inspect non-array fields for wrapped color structures.
+    for key, child in pairs(value) do
+        if not numericSeen[key] then
             local childType = typeof(child)
 
-            if childType == "Color3"
+            if type(child) == "table"
+            or childType == "Color3"
             or childType == "BrickColor"
-            or childType == "ColorSequence" then
-                collectColors(child, out, dedupe, seen, depth + 1)
+            or childType == "ColorSequence"
+            or type(child) == "string" then
+                collectColors(child, out, seen, depth + 1)
             end
         end
     end
@@ -339,14 +340,44 @@ end
 
 local function extractRecordColors(tbl)
     local colors = {}
-    local dedupe = {}
     local hasColorField = false
 
-    for _, keyName in ipairs(COLOR_KEYS) do
+    -- Prefer one authoritative collection field. This avoids accidentally
+    -- duplicating the whole palette when the same data is exposed by aliases.
+    local collectionKeys = {
+        "Colors",
+        "Colours",
+        "GradientColors",
+        "GradientColours",
+        "ColorSequence",
+        "ColourSequence",
+        "Gradient",
+    }
+
+    for _, keyName in ipairs(collectionKeys) do
         if hasKeyCI(tbl, keyName) then
             hasColorField = true
-            local value = tableGetCI(tbl, keyName)
-            collectColors(value, colors, dedupe)
+            collectColors(tableGetCI(tbl, keyName), colors)
+            return colors, hasColorField
+        end
+    end
+
+    -- Otherwise preserve individual color fields in their semantic order.
+    local individualKeys = {
+        "Color",
+        "Colour",
+        "PrimaryColor",
+        "SecondaryColor",
+        "TertiaryColor",
+        "Color1",
+        "Color2",
+        "Color3",
+    }
+
+    for _, keyName in ipairs(individualKeys) do
+        if hasKeyCI(tbl, keyName) then
+            hasColorField = true
+            collectColors(tableGetCI(tbl, keyName), colors)
         end
     end
 
@@ -719,7 +750,7 @@ local function inspectRecord(tbl, source, currentKey, contextHint)
     -- Some Fish It builds keep the visible Colors field empty while the
     -- real Color3/ColorSequence lives deeper in the same variant record.
     if hasColorField and #colors == 0 then
-        collectColors(tbl, colors, {})
+        collectColors(tbl, colors)
     end
 
     -- IMPORTANT: Colors = {} is still a valid known variant record.

@@ -266,6 +266,29 @@ local function collectColors(value, out, dedupe, seen, depth)
         return out
     end
 
+    if type(value) == "string" then
+        local hex = value:match("#?(%x%x%x%x%x%x)")
+        if hex and #hex == 6 then
+            addColor(
+                out,
+                dedupe,
+                rgbTriplet(
+                    tonumber(hex:sub(1, 2), 16),
+                    tonumber(hex:sub(3, 4), 16),
+                    tonumber(hex:sub(5, 6), 16)
+                )
+            )
+            return out
+        end
+
+        local rr, gg, bb = value:match("(%d+)%s*[,;]%s*(%d+)%s*[,;]%s*(%d+)")
+        if rr and gg and bb then
+            addColor(out, dedupe, rgbTriplet(rr, gg, bb))
+        end
+
+        return out
+    end
+
     if type(value) ~= "table" then
         return out
     end
@@ -540,14 +563,87 @@ end
 --==============================================================
 
 local EntriesByName = {}
+local ColorHintsById = {}
+local ColorHintsByName = {}
 local DatabaseText = ""
 local Scanning = false
 local DiscoveryOrder = 0
 
 local function resetState()
     EntriesByName = {}
+    ColorHintsById = {}
+    ColorHintsByName = {}
     DatabaseText = ""
     DiscoveryOrder = 0
+end
+
+local function rememberColorHint(key, colors)
+    if type(colors) ~= "table" or #colors == 0 then
+        return
+    end
+
+    if type(key) == "number" then
+        local id = asInteger(key)
+        if id and not ColorHintsById[id] then
+            ColorHintsById[id] = colors
+        end
+        return
+    end
+
+    if type(key) == "string" then
+        local numeric = asInteger(key)
+        if numeric and not ColorHintsById[numeric] then
+            ColorHintsById[numeric] = colors
+        end
+
+        local nameKey = lower(key)
+        if nameKey ~= ""
+        and nameKey ~= "colors"
+        and nameKey ~= "colours"
+        and not ColorHintsByName[nameKey] then
+            ColorHintsByName[nameKey] = colors
+        end
+    end
+end
+
+local function harvestColorMap(tbl, contextKey, source)
+    if type(tbl) ~= "table" then
+        return
+    end
+
+    local contextText = lower(contextKey)
+    local sourceText = lower(source)
+
+    local colorContext =
+        contains(contextText, "color")
+        or contains(contextText, "colour")
+        or contains(sourceText, "variant")
+        or contains(sourceText, "mutation")
+
+    if not colorContext then
+        return
+    end
+
+    for key, value in pairs(tbl) do
+        local colors = collectColors(value)
+
+        if #colors > 0 then
+            rememberColorHint(key, colors)
+
+            if type(value) == "table" then
+                local embeddedName = getFirstCI(value, NAME_KEYS)
+                local embeddedId = getFirstCI(value, ID_KEYS)
+
+                if embeddedName then
+                    rememberColorHint(tostring(embeddedName), colors)
+                end
+
+                if embeddedId then
+                    rememberColorHint(asInteger(embeddedId), colors)
+                end
+            end
+        end
+    end
 end
 
 local function addEntry(name, id, colors, source, confidence)
@@ -620,6 +716,12 @@ local function inspectRecord(tbl, source, currentKey, contextHint)
 
     local colors, hasColorField = extractRecordColors(tbl)
 
+    -- Some Fish It builds keep the visible Colors field empty while the
+    -- real Color3/ColorSequence lives deeper in the same variant record.
+    if hasColorField and #colors == 0 then
+        collectColors(tbl, colors, {})
+    end
+
     -- IMPORTANT: Colors = {} is still a valid known variant record.
     if not hasColorField then
         return
@@ -684,6 +786,10 @@ local function walkTable(root, source)
         local localHint = contextHint or keyLooksVariant(currentKey)
 
         inspectRecord(tbl, source, currentKey, localHint)
+
+        -- Second pass source: many versions keep variant colors in a
+        -- separate map (by numeric VariantId or by variant name).
+        harvestColorMap(tbl, currentKey, source)
 
         for key, value in pairs(tbl) do
             if type(value) == "table" then
@@ -808,6 +914,25 @@ end
 
 local function buildDatabase()
     local list = sortedEntries()
+
+    -- Merge color tables discovered separately from variant records.
+    for _, entry in ipairs(list) do
+        if #entry.Colors == 0 then
+            local hinted = nil
+
+            if entry.Id then
+                hinted = ColorHintsById[entry.Id]
+            end
+
+            if not hinted then
+                hinted = ColorHintsByName[lower(entry.Name)]
+            end
+
+            if hinted and #hinted > 0 then
+                entry.Colors = hinted
+            end
+        end
+    end
 
     -- Preserve real IDs when available. Missing/duplicate IDs receive
     -- a stable free numeric slot so the output stays VariantDatabase-compatible.
@@ -1014,6 +1139,12 @@ local function runScan()
         "LFAMILIA VARIANT + COLOR SCAN COMPLETE",
         "==================================================",
         "Variants found   : " .. tostring(#list),
+        "Color maps found : " .. tostring((function()
+            local n = 0
+            for _ in pairs(ColorHintsById) do n = n + 1 end
+            for _ in pairs(ColorHintsByName) do n = n + 1 end
+            return n
+        end)()),
         "Modules required : " .. tostring(required),
         "Modules failed   : " .. tostring(failed),
         "Modules timeout  : " .. tostring(timeout),
